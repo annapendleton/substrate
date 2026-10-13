@@ -2,6 +2,8 @@ module github.com/agent-substrate/substrate/internal/plugins/gcp-secret-manager
 
 go 1.27.0
 
+toolchain go1.27.2
+
 require (
 	cloud.google.com/go/secretmanager v1.16.0
 	github.com/agent-substrate/substrate v0.2.0
