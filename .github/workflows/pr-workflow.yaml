@@ -337,11 +337,16 @@ jobs:
         go run ./cmd/ate-setup deploy demo egress-microvm
     - name: Trust local TLS origins in egress gateway
       run: hack/setup-e2e-egress-tls-kind.sh
+    - name: Build kubectl-ate
+      # Built once for both lanes; the kubectlate suite otherwise builds it
+      # itself (see internal/e2e/suites/kubectlate).
+      run: go build -o "${RUNNER_TEMP}/kubectl-ate" ./cmd/kubectl-ate
     # scale the idle sandbox class's demo pools to zero so each lane has the node
     - name: Focus the node on gVisor
       run: hack/e2e-focus-sandbox-class.sh gvisor
     - name: Run E2E tests (gVisor)
       env:
+        KUBECTL_ATE_BIN: ${{ runner.temp }}/kubectl-ate
         E2E_PARALLELISM: 8
         E2E_JUNIT_FILE: ${{ github.workspace }}/_artifacts/e2e-gvisor${{ env.LANE_SUFFIX }}.xml
       run: hack/run-e2e-kind.sh -args --no-color --preview="${ATE_PREVIEW}"
@@ -352,6 +357,7 @@ jobs:
       # variant by the single E2E_SANDBOX_CLASS knob (see internal/e2e/sandbox.go).
       env:
         E2E_SANDBOX_CLASS: microvm
+        KUBECTL_ATE_BIN: ${{ runner.temp }}/kubectl-ate
         E2E_PARALLELISM: 8
         E2E_JUNIT_FILE: ${{ github.workspace }}/_artifacts/e2e-microvm${{ env.LANE_SUFFIX }}.xml
       run: hack/run-e2e-kind.sh -args --no-color --preview="${ATE_PREVIEW}"
