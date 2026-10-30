@@ -87,9 +87,27 @@ func copyPooled(dst io.Writer, src io.Reader) (int64, error) {
 // piling up a whole archive of them can run a worker pod out of memory.
 const writeBehindChunk = 8 << 20
 
+// Option configures CreateWithRootOptions.
+type Option func(*writeBehind)
+
+// WriteBehindChunk overrides writeBehindChunk. 0 never writes out or drops a
+// chunk early.
+func WriteBehindChunk(n int64) Option {
+	return func(w *writeBehind) { w.chunk = n }
+}
+
+// Lend is asked before each chunk is written out and dropped. When it returns
+// true the chunk stays in the page cache, and the caller writes the archive
+// back later (see snapshotcache.StartWriteback).
+func Lend(lend func(n int64) bool) Option {
+	return func(w *writeBehind) { w.lend = lend }
+}
+
 // writeBehind writes to f, writing out and dropping each full chunk.
 type writeBehind struct {
 	f       *os.File
+	chunk   int64
+	lend    func(n int64) bool
 	written int64
 	flushed int64
 }
@@ -97,16 +115,19 @@ type writeBehind struct {
 func (w *writeBehind) Write(p []byte) (int, error) {
 	n, err := w.f.Write(p)
 	w.written += int64(n)
-	if err != nil || w.written-w.flushed < writeBehindChunk {
+	if err != nil || w.chunk <= 0 || w.written-w.flushed < w.chunk {
 		return n, err
 	}
 	fd, off, size := int(w.f.Fd()), w.flushed, w.written-w.flushed
+	w.flushed = w.written
+	if w.lend != nil && w.lend(size) {
+		return n, nil
+	}
 	if err := unix.SyncFileRange(fd, off, size, unix.SYNC_FILE_RANGE_WAIT_BEFORE|unix.SYNC_FILE_RANGE_WRITE|unix.SYNC_FILE_RANGE_WAIT_AFTER); err != nil {
 		return n, fmt.Errorf("while writing out archive: %w", err)
 	}
 	// best effort, the range is on disk already
 	_ = unix.Fadvise(fd, off, size, unix.FADV_DONTNEED)
-	w.flushed = w.written
 	return n, nil
 }
 
@@ -134,7 +155,7 @@ type SkipFunc func(rel string) bool
 // CreateFiltered is Create with entries omitted where skip returns true. A nil
 // skip archives everything.
 func CreateFiltered(ctx context.Context, tarPath, srcDir string, skip SkipFunc) error {
-	return create(ctx, tarPath, srcDir, skip, false)
+	return create(ctx, tarPath, srcDir, skip, false, nil)
 }
 
 // CreateWithRoot is Create plus a "./" entry carrying srcDir's own mode,
@@ -143,13 +164,18 @@ func CreateWithRoot(ctx context.Context, tarPath, srcDir string) error {
 	return CreateFilteredWithRoot(ctx, tarPath, srcDir, nil)
 }
 
+// CreateWithRootOptions is CreateWithRoot with Options.
+func CreateWithRootOptions(ctx context.Context, tarPath, srcDir string, opts ...Option) error {
+	return create(ctx, tarPath, srcDir, nil, true, opts)
+}
+
 // CreateFilteredWithRoot is CreateWithRoot with entries omitted where skip
 // returns true. The root entry is never skipped.
 func CreateFilteredWithRoot(ctx context.Context, tarPath, srcDir string, skip SkipFunc) error {
-	return create(ctx, tarPath, srcDir, skip, true)
+	return create(ctx, tarPath, srcDir, skip, true, nil)
 }
 
-func create(ctx context.Context, tarPath, srcDir string, skip SkipFunc, includeRoot bool) error {
+func create(ctx context.Context, tarPath, srcDir string, skip SkipFunc, includeRoot bool, opts []Option) error {
 	f, err := os.Create(tarPath)
 	if err != nil {
 		return fmt.Errorf("creating tar %q: %w", tarPath, err)
@@ -157,7 +183,11 @@ func create(ctx context.Context, tarPath, srcDir string, skip SkipFunc, includeR
 	defer f.Close()
 
 	bw := tarWriterPool.Get().(*bufio.Writer)
-	bw.Reset(&writeBehind{f: f})
+	wb := &writeBehind{f: f, chunk: writeBehindChunk}
+	for _, o := range opts {
+		o(wb)
+	}
+	bw.Reset(wb)
 	defer func() {
 		bw.Reset(nil)
 		tarWriterPool.Put(bw)
