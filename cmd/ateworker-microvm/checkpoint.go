@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 
 	"go.ate.dev/substrate/internal/apierror"
@@ -37,6 +38,7 @@ import (
 	"go.ate.dev/substrate/internal/imagecache"
 	"go.ate.dev/substrate/internal/proto/ateworkerpb"
 	"go.ate.dev/substrate/internal/snapshotcache"
+	"go.ate.dev/substrate/internal/tarutil"
 	"go.ate.dev/substrate/internal/workerstats"
 	"golang.org/x/sync/errgroup"
 )
@@ -199,6 +201,8 @@ func (s *AteWorkerService) CheckpointWorkload(ctx context.Context, req *ateworke
 	//     VOLUMES the workload cold-starts on restore, discarding rootfs state.
 	shipsRootfs := includesRootfs(scope)
 	var durableFiles []string
+	var tarsLent atomic.Int64
+	tarOpts := s.tarOptions(&tarsLent)
 	g, gctx := errgroup.WithContext(ctx)
 	if scope == ateworkerpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY {
 		g.Go(func() error {
@@ -215,7 +219,7 @@ func (s *AteWorkerService) CheckpointWorkload(ctx context.Context, req *ateworke
 		g.Go(func() error {
 			t := time.Now()
 			var err error
-			durableFiles, err = tarDurableVolumes(gctx, actorDirs.GetDurableDirVolumeMountsDir(), checkpointDir, durableVolumeNames(req.GetSpec().GetContainers()))
+			durableFiles, err = tarDurableVolumes(gctx, actorDirs.GetDurableDirVolumeMountsDir(), checkpointDir, durableVolumeNames(req.GetSpec().GetContainers()), tarOpts...)
 			dDurable = time.Since(t)
 			return err
 		})
@@ -223,14 +227,16 @@ func (s *AteWorkerService) CheckpointWorkload(ctx context.Context, req *ateworke
 	if shipsRootfs {
 		g.Go(func() error {
 			t := time.Now()
-			err := tarRootfsUpper(gctx, rootfsUpperDir(actorDirs), checkpointDir, containerNames(req.GetSpec().GetContainers()))
+			err := tarRootfsUpper(gctx, rootfsUpperDir(actorDirs), checkpointDir, containerNames(req.GetSpec().GetContainers()), tarOpts...)
 			dUpper = time.Since(t)
 			return err
 		})
 	}
 	if err := g.Wait(); err != nil {
+		s.borrow.Return(tarsLent.Load())
 		return nil, err
 	}
+	s.startTarWriteback(ctx, actorUID, checkpointDir, tarsLent.Load())
 
 	// Report exactly the files we wrote so atelet ships precisely this snapshot:
 	// for MEMORY, the CH snapshot (config.json + state.json + memory-ranges +
@@ -397,6 +403,41 @@ func (s *AteWorkerService) writeSnapshot(ctx context.Context, client *ch.Client,
 		slog.WarnContext(ctx, "Failed to start snapshot writeback", slog.String("id", actorUID), slog.Any("err", err))
 	}
 	return nil
+}
+
+// tarOptions has the snapshot's tars keep their page cache when the pod can
+// lend it, the way writeSnapshot lifts memory.high, and write it out and drop
+// it a --tar-write-behind-mib chunk at a time when it can't. lent adds up what
+// they borrowed, for startTarWriteback to return.
+func (s *AteWorkerService) tarOptions(lent *atomic.Int64) []tarutil.Option {
+	return []tarutil.Option{
+		tarutil.WriteBehindChunk(s.tarWriteBehind),
+		tarutil.Lend(func(n int64) bool {
+			got := s.borrow.Take(n)
+			if got < n {
+				s.borrow.Return(got)
+				return false
+			}
+			lent.Add(n)
+			return true
+		}),
+	}
+}
+
+// startTarWriteback writes the tars' lent page cache back in the background
+// and then returns it, as writeSnapshot does for the CH snapshot.
+func (s *AteWorkerService) startTarWriteback(ctx context.Context, actorUID, checkpointDir string, lent int64) {
+	if lent == 0 {
+		return
+	}
+	tars, err := filepath.Glob(filepath.Join(checkpointDir, "*.tar"))
+	if err == nil {
+		err = snapshotcache.StartWriteback(tars, func() { s.borrow.Return(lent) })
+	}
+	if err != nil {
+		s.borrow.Return(lent)
+		slog.WarnContext(ctx, "Failed to start tar writeback", slog.String("id", actorUID), slog.Any("err", err))
+	}
 }
 
 // mergeOnDemandDelta merges the OnDemand delta in checkpointDir with the base in

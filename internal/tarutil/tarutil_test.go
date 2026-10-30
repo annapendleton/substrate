@@ -219,6 +219,35 @@ func TestRoundTripLargeFile(t *testing.T) {
 	}
 }
 
+// Lend keeps the chunks it accepts in the page cache, and is asked for each
+// full chunk.
+func TestCreateLend(t *testing.T) {
+	src := t.TempDir()
+	if err := os.WriteFile(filepath.Join(src, "big"), make([]byte, 3*writeBehindChunk), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var lent int64
+	lend := func(n int64) bool { lent += n; return true }
+	if err := CreateWithRootOptions(t.Context(), filepath.Join(t.TempDir(), "out.tar"), src, Lend(lend)); err != nil {
+		t.Fatalf("CreateWithRootOptions: %v", err)
+	}
+	if lent < 3*writeBehindChunk {
+		t.Errorf("lent %d bytes, want at least %d", lent, 3*writeBehindChunk)
+	}
+}
+
+// WriteBehindChunk(0) never writes out a chunk early, so Lend is never asked.
+func TestCreateNoWriteBehind(t *testing.T) {
+	src := t.TempDir()
+	if err := os.WriteFile(filepath.Join(src, "big"), make([]byte, 2*writeBehindChunk), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	lend := func(n int64) bool { t.Errorf("Lend(%d) asked with write-behind off", n); return false }
+	if err := CreateWithRootOptions(t.Context(), filepath.Join(t.TempDir(), "out.tar"), src, WriteBehindChunk(0), Lend(lend)); err != nil {
+		t.Fatalf("CreateWithRootOptions: %v", err)
+	}
+}
+
 func TestCreateEmptyDir(t *testing.T) {
 	tarPath := filepath.Join(t.TempDir(), "empty.tar")
 	if err := Create(t.Context(), tarPath, t.TempDir()); err != nil {

@@ -82,6 +82,7 @@ var (
 	readinessListenAddress = pflag.String("readiness-listen-address", "0.0.0.0:8080", "Address for the HTTP /readyz and /healthz probes")
 	maxActors              = pflag.Int("max-actors", 1000, "How many actors this worker will host at once")
 	usageSampleInterval    = pflag.Duration("usage-sample-interval", time.Minute, "How often the ateworker samples the resource usage of its actors. Each sample writes an ate.actor.usage_sampled record per actor, and GetActiveWorkloadStats serves the latest.")
+	tarWriteBehindMiB      = pflag.Int("tar-write-behind-mib", 8, "How many MiB of a rootfs upper or durable-dir tar may be dirty in the page cache before it is written out and dropped, unless the pod can lend the memory. 0 never writes a tar out early.")
 )
 
 // minUsageSampleInterval is the floor of --usage-sample-interval, the same as
@@ -121,6 +122,9 @@ func do(ctx context.Context) error {
 	slog.InfoContext(ctx, "ateworker-microvm booting", slog.String("version", version.Version))
 	if *maxActors < 0 {
 		return fmt.Errorf("--max-actors must not be negative, got %d", *maxActors)
+	}
+	if *tarWriteBehindMiB < 0 {
+		return fmt.Errorf("--tar-write-behind-mib must not be negative, got %d", *tarWriteBehindMiB)
 	}
 	if *usageSampleInterval < minUsageSampleInterval {
 		return fmt.Errorf("--usage-sample-interval must be at least %v, got %v", minUsageSampleInterval, *usageSampleInterval)
@@ -240,6 +244,7 @@ func do(ctx context.Context) error {
 	}
 	ateworkerService := NewService(*podUID, *chBinary, *guestDebug, *maxActors, tunnel, actorLogger, bootID)
 	ateworkerService.throttleMemory = cgroup.PSIEnabled(cgroup.Root)
+	ateworkerService.tarWriteBehind = int64(*tarWriteBehindMiB) << 20
 	if !ateworkerService.throttleMemory {
 		slog.WarnContext(ctx, "Kernel has no cgroup memory pressure (PSI), so actor cgroups get no memory limit and an actor over its booking can restart the worker")
 	}
@@ -396,6 +401,8 @@ type AteWorkerService struct {
 	// throttleMemory is set when actor cgroups get memory.high at what the
 	// actor books, with watchMemory killing the ones stuck there.
 	throttleMemory bool
+	// tarWriteBehind is --tar-write-behind-mib in bytes.
+	tarWriteBehind int64
 
 	// actorLogger forwards the actor container's stdout/stderr to the worker pod's
 	// stdout as ate.dev/*-labeled JSON and emits actor lifecycle events (parity
@@ -431,6 +438,7 @@ func NewService(podUID, chBinary string, guestDebug bool, maxActors int, tunnel 
 		chBinary:       chBinary,
 		guestDebug:     guestDebug,
 		snapshotWrites: make(chan struct{}, snapshotWriteSlots),
+		tarWriteBehind: 8 << 20,
 		tunnel:         tunnel,
 		actorLogger:    actorLogger,
 		bootID:         bootID,
