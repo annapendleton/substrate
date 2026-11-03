@@ -91,3 +91,47 @@ func TestWriteSync(t *testing.T) {
 		t.Errorf("dir holds %d entries after WriteSync, want only the file", len(entries))
 	}
 }
+
+// TestWriteCreates covers a target that doesn't exist yet, which can't be
+// exchanged with the temp file.
+func TestWriteCreates(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sandbox-assets.json")
+	if err := Write(path, []byte("v1"), 0o600); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil || string(got) != "v1" {
+		t.Fatalf("ReadFile = %q, %v; want v1", got, err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Errorf("dir holds %d entries after Write, want only the file", len(entries))
+	}
+}
+
+// TestWriteOverDirectoryFails covers a directory where the file goes: Write
+// fails and leaves the directory where it was.
+func TestWriteOverDirectoryFails(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	if err := os.MkdirAll(filepath.Join(path, "child"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := Write(path, []byte("v1"), 0o600); err == nil {
+		t.Fatal("Write over a directory succeeded, want an error")
+	}
+	if info, err := os.Stat(filepath.Join(path, "child")); err != nil || !info.IsDir() {
+		t.Errorf("directory at the target after a failed Write: %v, %v", info, err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Errorf("dir holds %d entries after a failed Write, want only the target", len(entries))
+	}
+}

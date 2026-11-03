@@ -42,7 +42,8 @@ func write(path string, data []byte, perm os.FileMode, sync bool) error {
 	if err != nil {
 		return err
 	}
-	defer os.Remove(f.Name()) // no-op once the rename succeeds
+	// no-op once a rename succeeds; after an exchange it removes the old file
+	defer os.Remove(f.Name())
 
 	if _, err := f.Write(data); err != nil {
 		f.Close()
@@ -61,11 +62,11 @@ func write(path string, data []byte, perm os.FileMode, sync bool) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
+	if !sync {
+		return replace(f.Name(), path)
+	}
 	if err := os.Rename(f.Name(), path); err != nil {
 		return err
-	}
-	if !sync {
-		return nil
 	}
 	dir, err := os.Open(filepath.Dir(path))
 	if err != nil {
